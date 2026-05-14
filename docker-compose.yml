@@ -1,0 +1,29 @@
+services:
+  proxy:
+    build: ./proxy
+    container_name: ollama-lb-proxy
+    restart: unless-stopped
+    ports:
+      - "11434:11434"       # Ollama-compatible API — point your clients here
+    volumes:
+      - lb-data:/data       # Persists backend config across restarts
+    environment:
+      - PORT=11434
+      - CONFIG_PATH=/data/config.json
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:11434/admin/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ui:
+    build: ./ui
+    container_name: ollama-lb-ui
+    restart: unless-stopped
+    ports:
+      - "8080:80"           # Admin UI — open http://localhost:8080
+    depends_on:
+      - proxy
+
+volumes:
+  lb-data:
