@@ -98,6 +98,14 @@ async function handleV1Models(backends, res) {
   res.json({ object: "list", data });
 }
 
+// Ollama rejects Anthropic-only body fields (e.g. extended thinking). Strip them before forwarding.
+function stripAnthropicOnly(body) {
+  if (!body || typeof body !== "object") return body;
+  // "thinking" = Anthropic format; "reasoning" = OpenAI o-series format (what claude-code-router sends)
+  const { thinking, betas, reasoning, ...rest } = body;
+  return rest;
+}
+
 // Single-backend proxy with session tracking
 async function proxyToOne(backend, req, res, balancer, sessionKey) {
   balancer.incrementActive(backend.id);
@@ -105,7 +113,7 @@ async function proxyToOne(backend, req, res, balancer, sessionKey) {
 
   try {
     let body;
-    if (req.method !== "GET" && req.method !== "HEAD") body = JSON.stringify(req.body);
+    if (req.method !== "GET" && req.method !== "HEAD") body = JSON.stringify(stripAnthropicOnly(req.body));
 
     const upstreamRes = await fetch(`${backend.url}${req.originalUrl}`, {
       method: req.method,
@@ -466,7 +474,7 @@ async function handleResponsesAPI(req, res, balancer) {
     setSession(ip, model, backend);
   }
 
-  const chatBody = responsesToChatBody(req.body);
+  const chatBody = stripAnthropicOnly(responsesToChatBody(req.body));
   const isStreaming = chatBody.stream === true;
   balancer.incrementActive(backend.id);
   const start = Date.now();
