@@ -20,6 +20,7 @@ export const api = {
   removeBackend: (id)                        => req("DELETE", `/backends/${id}`),
   toggleBackend: (id, enabled)               => req("PATCH",  `/backends/${id}`,      { enabled }),
   checkBackend:  (id)                        => req("POST",   `/backends/${id}/check`),
+  pullToBackend: (id, model)                 => req("POST",   `/backends/${id}/pull`,  { model }),
   checkAll:      ()                          => req("POST",   "/backends/check-all"),
   setStrategy:   (strategy)                  => req("PUT",    "/strategy",            { strategy }),
   models:        ()                          => req("GET",    "/models"),
@@ -29,4 +30,5 @@ export const api = {
   extendSession: (id)                        => req("POST",   `/sessions/${encodeURIComponent(id)}/extend`, {}),
   shodan:        (apiKey, query, limit = 5, page = 1)  => req("POST",   "/shodan",              { apiKey, query, limit, page }),
   updateVersion: (version)                             => req("PUT",    "/version",             { version }),
+  pingUrl:       (url, timeout = 10000, retries = 2)   => req("POST",   "/ping-url",            { url, timeout, retries }),
 };

@@ -93,49 +93,60 @@ function StatCard({ label, value, sub, color }) {
 }
 
 // ── Backends tab ───────────────────────────────────────────────────────────
-function BackendRow({ backend, onRemove, onToggle, onCheck, checking }) {
+function BackendRow({ backend, onRemove, onToggle, onCheck, checking, pullModel, onPull, pulling, pullResult }) {
   return (
     <div style={{
-      display: "flex", alignItems: "center", gap: 10, padding: "9px 14px",
       background: backend.enabled ? C.panel : C.bg,
       border: `1px solid ${backend.enabled ? C.border : "#111827"}`,
       borderRadius: 8, opacity: backend.enabled ? 1 : 0.55, transition: "all 0.15s",
     }}>
-      <Pulse color={statusColor(backend.status)} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {backend.geo?.flag && (
-            <span title={backend.geo.country} style={{ fontSize: 16, lineHeight: 1 }}>{backend.geo.flag}</span>
-          )}
-          <span style={{ fontFamily: mono, fontSize: 13, color: backend.enabled ? C.text : C.dim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {backend.url}
-          </span>
-          {backend.geo?.country && !backend.geo?.flag && (
-            <span style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>{backend.geo.country}</span>
-          )}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 14px" }}>
+        <Pulse color={statusColor(backend.status)} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {backend.geo?.flag && (
+              <span title={backend.geo.country} style={{ fontSize: 16, lineHeight: 1 }}>{backend.geo.flag}</span>
+            )}
+            <span style={{ fontFamily: mono, fontSize: 13, color: backend.enabled ? C.text : C.dim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {backend.url}
+            </span>
+            {backend.geo?.country && !backend.geo?.flag && (
+              <span style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>{backend.geo.country}</span>
+            )}
+          </div>
         </div>
+        {backend.ollamaVersion && <Chip>{`v${backend.ollamaVersion}`}</Chip>}
+        {backend.modelCount != null && <Chip>{backend.modelCount} models</Chip>}
+        {backend.activeRequests > 0 && <Chip accent>{backend.activeRequests} active</Chip>}
+        {backend.totalRequests > 0 && <Chip>{backend.totalRequests} req</Chip>}
+        {backend.lastLatency != null && <Chip>{backend.lastLatency}ms</Chip>}
+        {pullModel && (
+          <Btn small variant="warn" onClick={() => onPull(backend.id)} disabled={pulling || !backend.enabled || backend.status !== "online"} title={backend.status !== "online" ? "Backend offline" : `Pull ${pullModel}`}>
+            {pulling ? "pulling…" : "↓ pull"}
+          </Btn>
+        )}
+        <Btn small onClick={() => onCheck(backend.id)} disabled={checking}>{checking ? "…" : "ping"}</Btn>
+        <Btn small variant={backend.enabled ? "success" : "ghost"} onClick={() => onToggle(backend.id, !backend.enabled)}>
+          {backend.enabled ? "on" : "off"}
+        </Btn>
+        <Btn small variant="danger" onClick={() => onRemove(backend.id)}>✕</Btn>
       </div>
-      {backend.ollamaVersion && <Chip>{`v${backend.ollamaVersion}`}</Chip>}
-      {backend.modelCount != null && <Chip>{backend.modelCount} models</Chip>}
-      {backend.activeRequests > 0 && <Chip accent>{backend.activeRequests} active</Chip>}
-      {backend.totalRequests > 0 && <Chip>{backend.totalRequests} req</Chip>}
-      {backend.lastLatency != null && <Chip>{backend.lastLatency}ms</Chip>}
-      <Btn small onClick={() => onCheck(backend.id)} disabled={checking}>{checking ? "…" : "ping"}</Btn>
-      <Btn small variant={backend.enabled ? "success" : "ghost"} onClick={() => onToggle(backend.id, !backend.enabled)}>
-        {backend.enabled ? "on" : "off"}
-      </Btn>
-      <Btn small variant="danger" onClick={() => onRemove(backend.id)}>✕</Btn>
+      {pullResult && (
+        <div style={{ padding: "0 14px 7px", fontFamily: mono, fontSize: 10, color: pullResult.ok ? C.teal : C.red }}>
+          {pullResult.ok ? "↓ " : "✗ "}{pullResult.msg}
+        </div>
+      )}
     </div>
   );
 }
 
-function Chip({ children, accent }) {
+function Chip({ children, accent, style: sx }) {
   return <span style={{
     display: "inline-block", background: accent ? "#0c3a5f" : C.panel,
     border: `1px solid ${accent ? C.blue : C.border}`,
     color: accent ? C.blue : C.text,
     fontSize: 10, fontFamily: mono, padding: "1px 6px", borderRadius: 4,
-    letterSpacing: "0.04em", whiteSpace: "nowrap",
+    letterSpacing: "0.04em", whiteSpace: "nowrap", ...sx,
   }}>{children}</span>;
 }
 
@@ -350,6 +361,7 @@ function ModelsTab() {
         <StatCard label="TOTAL MODELS" value={models.length} sub="union across all nodes" />
         <StatCard label="ON ALL NODES" value={everywhere.length} color={C.green} sub="fully replicated" />
         <StatCard label="PARTIAL" value={partial.length} color={partial.length > 0 ? C.amber : C.dim} sub={partial.length > 0 ? "some nodes missing" : "none"} />
+        <StatCard label="TOOL-CAPABLE" value={models.filter((m) => m.toolCompatible).length} color={C.purple} sub="support function calling" />
         <StatCard label="ONLINE NODES" value={onlineBackendCount} />
       </div>
 
@@ -393,6 +405,7 @@ function ModelsTab() {
                 border: `1px solid ${C.border}`, borderRadius: 8,
               }}>
                 <span style={{ fontFamily: mono, fontSize: 13, color: C.bright, fontWeight: 500, flex: 1 }}>{m.name}</span>
+                {m.toolCompatible && <Chip style={{ borderColor: C.purple, color: C.purple, background: "#1a0a2e" }}>⚙ tools</Chip>}
                 {fmtSize(m.size) && <span style={{ fontFamily: mono, fontSize: 11, color: C.dim }}>{fmtSize(m.size)}</span>}
                 <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
                   {m.presentOn.map((b, i) => <NodePip key={i} {...b} has />)}
@@ -424,6 +437,7 @@ function ModelsTab() {
                     padding: "11px 14px", borderBottom: `1px solid #2a2200`,
                   }}>
                     <span style={{ fontFamily: mono, fontSize: 13, color: C.bright, fontWeight: 600, flex: 1 }}>{m.name}</span>
+                    {m.toolCompatible && <Chip style={{ borderColor: C.purple, color: C.purple, background: "#1a0a2e" }}>⚙ tools</Chip>}
                     {fmtSize(m.size) && <span style={{ fontFamily: mono, fontSize: 11, color: C.dim }}>{fmtSize(m.size)}</span>}
                     <span style={{ fontFamily: mono, fontSize: 11, color: C.amber }}>{m.presentCount}/{onlineBackendCount} nodes</span>
                   </div>
@@ -509,6 +523,17 @@ function LogRow({ entry }) {
 // ── Discover tab (Shodan) ──────────────────────────────────────────────────
 const DEFAULT_SHODAN_QUERY = '"ollama is running" -org:"Amazon" -org:"Amazon.com, Inc." -org:"Amazon"';
 
+function parseQueryAndCountry(rawQuery) {
+  let cleaned = (rawQuery || "").trim();
+  let extractedCountry = null;
+  const match = cleaned.match(/\bcountry:\s*("([^"]+)"|'([^']+)'|(\S+))/i);
+  if (match) {
+    extractedCountry = match[2] || match[3] || match[4];
+    cleaned = cleaned.replace(match[0], "").replace(/\s+/g, " ").trim();
+  }
+  return { apiQuery: cleaned || DEFAULT_SHODAN_QUERY, extractedCountry };
+}
+
 function DiscoverTab({ onAddBackend, existingUrls }) {
   const [apiKey, setApiKey]   = useState(() => localStorage.getItem("shodan_api_key") || "");
   const [query, setQuery]     = useState(DEFAULT_SHODAN_QUERY);
@@ -531,9 +556,13 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
   async function runSearch() {
     if (!apiKey.trim()) { setError("Enter your Shodan API key first."); return; }
     setLoading(true); setError(null); setResults(null);
-    setPingStatus({}); setAdded({}); setPage(1); setCountryFilter("");
+    setPingStatus({}); setAdded({}); setPage(1);
+
+    const { apiQuery, extractedCountry } = parseQueryAndCountry(query);
+    setCountryFilter(extractedCountry || "");
+
     try {
-      const data = await api.shodan(apiKey.trim(), query.trim() || DEFAULT_SHODAN_QUERY, 20, 1);
+      const data = await api.shodan(apiKey.trim(), apiQuery, 20, 1);
       setResults(data);
       // Ping all discovered instances in background
       data.results.forEach((r) => pingInstance(r.url, r.ip));
@@ -547,8 +576,9 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
     if (loadingMore) return;
     const nextPage = page + 1;
     setLoadingMore(true);
+    const { apiQuery } = parseQueryAndCountry(query);
     try {
-      const data = await api.shodan(apiKey.trim(), query.trim() || DEFAULT_SHODAN_QUERY, 20, nextPage);
+      const data = await api.shodan(apiKey.trim(), apiQuery, 20, nextPage);
       setResults((prev) => ({
         ...data,
         results: [...prev.results, ...data.results]
@@ -564,16 +594,38 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
   async function pingInstance(url, key) {
     setPingStatus((p) => ({ ...p, [key]: "checking" }));
     try {
-      const res = await fetch(`${url}/api/version`, { signal: AbortSignal.timeout(5000) });
-      if (res.ok) {
-        const data = await res.json();
-        setPingStatus((p) => ({ ...p, [key]: { online: true, version: data.version } }));
-      } else {
-        setPingStatus((p) => ({ ...p, [key]: { online: false } }));
+      // 1. Try server-side ping endpoint (bypasses browser CORS & supports retries/10s timeout)
+      const data = await api.pingUrl(url, 10000, 2);
+      if (data.online) {
+        setPingStatus((p) => ({
+          ...p,
+          [key]: { online: true, version: data.version, latency: data.latency, attempt: data.attempt }
+        }));
+        return;
       }
-    } catch {
-      setPingStatus((p) => ({ ...p, [key]: { online: false } }));
+    } catch {}
+
+    // 2. Fallback: Direct client-side ping with retries & 10s timeout
+    let success = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const start = Date.now();
+        const res = await fetch(`${url}/api/version`, { signal: AbortSignal.timeout(10000) });
+        const latency = Date.now() - start;
+        if (res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setPingStatus((p) => ({
+            ...p,
+            [key]: { online: true, version: data.version, latency, attempt }
+          }));
+          success = true;
+          break;
+        }
+      } catch {
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 600));
+      }
     }
+    if (!success) setPingStatus((p) => ({ ...p, [key]: { online: false } }));
   }
 
   async function addNode(result) {
@@ -583,6 +635,15 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
       setAdded((a) => ({ ...a, [result.ip]: true }));
     } catch {}
     setAdding((a) => ({ ...a, [result.ip]: false }));
+  }
+
+  function pingUnreachable() {
+    if (!results) return;
+    results.results.forEach((r) => {
+      if (pingStatus[r.ip]?.online === false || !pingStatus[r.ip]) {
+        pingInstance(r.url, r.ip);
+      }
+    });
   }
 
   const alreadyAdded = (url) => existingUrls.includes(url);
@@ -652,7 +713,7 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
       {results && (() => {
         const countries = [...new Set(results.results.map((r) => r.country).filter(Boolean))].sort();
         const displayResults = countryFilter
-          ? results.results.filter((r) => r.country === countryFilter)
+          ? results.results.filter((r) => r.country === countryFilter || r.countryCode?.toUpperCase() === countryFilter.trim().toUpperCase())
           : results.results;
         return (
         <div>
@@ -662,6 +723,13 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
                 ? `${displayResults.length} in ${countryFilter} · ${results.total.toLocaleString()} total`
                 : `showing ${results.results.length} of ${results.total.toLocaleString()} total matches`}
             </span>
+            <button
+              onClick={pingUnreachable}
+              title="Re-check all unreachable or unpinged nodes with 10s timeout & retries"
+              style={{ background: "none", border: `1px solid ${C.border}`, color: C.dim, borderRadius: 5, padding: "3px 8px", fontFamily: mono, fontSize: 10, cursor: "pointer" }}
+            >
+              🔄 Re-ping Unreachable
+            </button>
             {countries.length > 1 && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
                 <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, letterSpacing: "0.1em" }}>COUNTRY</span>
@@ -700,7 +768,13 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
                 const already = alreadyAdded(r.url) || added[r.ip];
 
                 const pingColor  = isOnline ? C.green : isOffline ? C.red : isChecking ? C.amber : C.muted;
-                const pingLabel  = isOnline ? "online" : isOffline ? "unreachable" : isChecking ? "pinging…" : "not pinged";
+                const pingLabel  = isOnline
+                  ? `online (${ping.latency ? `${ping.latency}ms` : "ok"})`
+                  : isOffline
+                  ? "unreachable"
+                  : isChecking
+                  ? "pinging (10s, retry 3x)…"
+                  : "not pinged";
 
                 return (
                   <div key={r.ip} style={{
@@ -821,6 +895,9 @@ export default function App() {
   const [checking, setChecking] = useState({});
   const [adding, setAdding] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
+  const [pullModel, setPullModel] = useState("");
+  const [pulling, setPulling] = useState({});
+  const [pullResult, setPullResult] = useState({});
   const [editingVersion, setEditingVersion] = useState(false);
   const [versionInput, setVersionInput] = useState("");
   const logRef = useRef(null);
@@ -864,6 +941,19 @@ export default function App() {
     setChecking((c) => ({ ...c, [id]: true }));
     try { await api.checkBackend(id); await fetchStatus(); } catch (e) { setError(e.message); }
     setChecking((c) => ({ ...c, [id]: false }));
+  }
+
+  async function pullToBackend(id) {
+    if (!pullModel.trim()) return;
+    setPulling((p) => ({ ...p, [id]: true }));
+    setPullResult((r) => ({ ...r, [id]: null }));
+    try {
+      await api.pullToBackend(id, pullModel.trim());
+      setPullResult((r) => ({ ...r, [id]: { ok: true, msg: `Pulling ${pullModel.trim()} in background…` } }));
+    } catch (e) {
+      setPullResult((r) => ({ ...r, [id]: { ok: false, msg: e.message } }));
+    }
+    setPulling((p) => ({ ...p, [id]: false }));
   }
 
   async function checkAll() {
@@ -1009,6 +1099,22 @@ export default function App() {
                 <Btn variant="primary" onClick={addBackend} disabled={adding}>{adding ? "Adding…" : "+ Add"}</Btn>
               </div>
             </Card>
+            <Card>
+              <SectionLabel>PULL MODEL TO SELECTED NODES</SectionLabel>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input value={pullModel} onChange={(e) => { setPullModel(e.target.value); setPullResult({}); }}
+                  onKeyDown={(e) => e.key === "Escape" && (setPullModel(""), setPullResult({}))}
+                  placeholder="e.g. llama3.2-vision:11b"
+                  style={{ flex: 1, background: C.panel, border: `1px solid ${C.borderBright}`, color: C.white, borderRadius: 6, padding: "8px 12px", fontFamily: mono, fontSize: 13, outline: "none" }}
+                />
+                {pullModel && <Btn small variant="ghost" onClick={() => { setPullModel(""); setPullResult({}); }}>clear</Btn>}
+              </div>
+              {pullModel && (
+                <div style={{ marginTop: 8, fontFamily: mono, fontSize: 11, color: C.dim }}>
+                  Click <span style={{ color: C.amber }}>↓ pull</span> on the backends you want to pull to.
+                </div>
+              )}
+            </Card>
             <Card style={{ padding: 0 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: backends.length > 0 ? `1px solid ${C.border}` : "none" }}>
                 <SectionLabel style={{ margin: 0 }}>{backends.length} BACKEND{backends.length !== 1 ? "S" : ""}</SectionLabel>
@@ -1020,7 +1126,9 @@ export default function App() {
                     {backends.map((b) => (
                       <BackendRow key={b.id} backend={b}
                         onRemove={removeBackend} onToggle={toggleBackend}
-                        onCheck={checkBackend} checking={checking[b.id]} />
+                        onCheck={checkBackend} checking={checking[b.id]}
+                        pullModel={pullModel} onPull={pullToBackend}
+                        pulling={pulling[b.id]} pullResult={pullResult[b.id]} />
                     ))}
                   </div>
               }

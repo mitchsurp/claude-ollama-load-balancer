@@ -16,6 +16,15 @@ services:
       timeout: 5s
       retries: 3
 
+    labels:
+      - "homepage.group=AI"
+      - "homepage.name=Ollama Load Balancer Proxy"
+      - "homepage.icon=ollama.png"
+      - "homepage.href=http://192.168.1.205:11434"
+      - "homepage.container=ollama-lb-proxy"
+      - "homepage.server=vibebox"
+      - "homepage.siteMonitor=http://192.168.1.205:11434"
+
   ui:
     build: ./ui
     container_name: ollama-lb-ui
@@ -24,6 +33,14 @@ services:
       - "8080:80"           # Admin UI — open http://localhost:8080
     depends_on:
       - proxy
+    labels:
+      - "homepage.group=AI"
+      - "homepage.name=Ollama Load Balancer UI"
+      - "homepage.icon=ollama.png"
+      - "homepage.href=http://192.168.1.205:8080"
+      - "homepage.container=ollama-lb-ui"
+      - "homepage.server=vibebox"
+      - "homepage.siteMonitor=http://192.168.1.205:8080"
 
 volumes:
   lb-data:

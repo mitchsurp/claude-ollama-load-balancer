@@ -54,11 +54,52 @@ app.patch("/admin/backends/:id", (req, res) => {
   res.json(backend);
 });
 
+app.post("/admin/ping-url", async (req, res) => {
+  const { url, timeout = 10000, retries = 2 } = req.body;
+  if (!url) return res.status(400).json({ error: "url required" });
+
+  const cleanUrl = url.trim().replace(/\/$/, "");
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    const start = Date.now();
+    try {
+      const response = await fetch(`${cleanUrl}/api/version`, { signal: AbortSignal.timeout(timeout) });
+      const latency = Date.now() - start;
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        return res.json({ online: true, version: data.version || null, latency, attempt });
+      }
+    } catch (e) {
+      if (attempt === retries + 1) {
+        return res.json({ online: false, error: e.message, attempts: attempt });
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+});
+
 app.post("/admin/backends/:id/check", async (req, res) => {
   const result = await balancer.checkBackend(req.params.id);
   if (!result) return res.status(404).json({ error: "not found" });
   saveConfig(balancer);
   res.json(result);
+});
+
+app.post("/admin/backends/:id/pull", async (req, res) => {
+  const { model } = req.body;
+  if (!model) return res.status(400).json({ error: "model required" });
+  const backend = balancer.getBackends().find((b) => b.id === req.params.id);
+  if (!backend) return res.status(404).json({ error: "not found" });
+  if (!backend.enabled || backend.status !== "online") return res.status(400).json({ error: "backend is offline" });
+
+  res.json({ status: "pulling", model, backend: backend.url });
+
+  fetch(`${backend.url}/api/pull`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: model, stream: false }),
+  })
+    .then(() => logger.log({ method: "POST", path: "/api/pull", status: 200, backend: backend.url, latency: 0, note: `pull:${model}` }))
+    .catch((e) => logger.log({ method: "POST", path: "/api/pull", status: 502, backend: backend.url, latency: 0, error: e.message, note: `pull:${model}` }));
 });
 
 app.post("/admin/backends/check-all", async (req, res) => {
@@ -115,6 +156,26 @@ app.get("/admin/models", async (req, res) => {
   // Union of all model names
   const allNames = [...new Set(inventories.flatMap((b) => b.models.map((m) => m.name)))].sort();
 
+  // Check tool compatibility via /api/show — look for .Tools in the model template
+  const toolCompatMap = {};
+  await Promise.all(allNames.map(async (name) => {
+    const source = inventories.find((b) => !b.error && b.models.some((m) => m.name === name));
+    if (!source) { toolCompatMap[name] = false; return; }
+    try {
+      const r = await fetch(`${source.url}/api/show`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!r.ok) { toolCompatMap[name] = false; return; }
+      const data = await r.json();
+      toolCompatMap[name] = (data.template || "").includes(".Tools");
+    } catch {
+      toolCompatMap[name] = false;
+    }
+  }));
+
   const models = allNames.map((name) => {
     const presentOn = inventories
       .filter((b) => b.models.some((m) => m.name === name))
@@ -135,6 +196,7 @@ app.get("/admin/models", async (req, res) => {
 
     return {
       name, size,
+      toolCompatible: toolCompatMap[name] ?? false,
       modifiedAt: presentOn[0]?.model?.modified_at || null,
       presentCount: presentOn.length,
       totalOnline: onlineCount,

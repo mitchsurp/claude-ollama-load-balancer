@@ -1,7 +1,10 @@
 import { randomUUID } from "crypto";
 import fetch from "node-fetch";
 import { logger } from "./logger.js";
-import { getSession, setSession, touchSession } from "./sessions.js";
+import { getSession, setSession, touchSession, deleteSessionById } from "./sessions.js";
+
+// Per-request timeout; generous default for LLM inference but still catches dead backends
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "300000", 10);
 
 const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -98,11 +101,38 @@ async function handleV1Models(backends, res) {
   res.json({ object: "list", data });
 }
 
-// Ollama rejects Anthropic-only body fields (e.g. extended thinking). Strip them before forwarding.
-function stripAnthropicOnly(body) {
+// Strip Anthropic-only fields and normalize for Ollama's OpenAI-compatible API.
+function normalizeForOllama(body) {
   if (!body || typeof body !== "object") return body;
   // "thinking" = Anthropic format; "reasoning" = OpenAI o-series format (what claude-code-router sends)
   const { thinking, betas, reasoning, ...rest } = body;
+  // Ollama requires tool_choice: "auto" to actually invoke tools; without it models respond in prose.
+  if (rest.tools?.length && rest.tool_choice === undefined) {
+    rest.tool_choice = "auto";
+  }
+  // Local models miss the CWD buried in Claude Code's long system prompt. Extract it and prepend
+  // a short reminder to the last user message so the model sees it immediately before responding.
+  if (Array.isArray(rest.messages)) {
+    const systemMsg = rest.messages.find((m) => m.role === "system");
+    const systemText = typeof systemMsg?.content === "string"
+      ? systemMsg.content
+      : systemMsg?.content?.map?.((c) => c.text || "").join("") || "";
+    const cwdMatch = systemText.match(/Primary working directory:\s*(\S+)/);
+    if (cwdMatch) {
+      const cwd = cwdMatch[1];
+      const messages = [...rest.messages];
+      const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+      if (lastUserIdx !== -1) {
+        const msg = messages[lastUserIdx];
+        const originalContent = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+        messages[lastUserIdx] = {
+          ...msg,
+          content: `[Working directory: ${cwd}]\n${originalContent}`,
+        };
+        rest.messages = messages;
+      }
+    }
+  }
   return rest;
 }
 
@@ -113,7 +143,7 @@ async function proxyToOne(backend, req, res, balancer, sessionKey) {
 
   try {
     let body;
-    if (req.method !== "GET" && req.method !== "HEAD") body = JSON.stringify(stripAnthropicOnly(req.body));
+    if (req.method !== "GET" && req.method !== "HEAD") body = JSON.stringify(normalizeForOllama(req.body));
 
     const upstreamRes = await fetch(`${backend.url}${req.originalUrl}`, {
       method: req.method,
@@ -123,6 +153,7 @@ async function proxyToOne(backend, req, res, balancer, sessionKey) {
         "content-type": "application/json",
       },
       body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
     const latency = Date.now() - start;
@@ -146,6 +177,9 @@ async function proxyToOne(backend, req, res, balancer, sessionKey) {
     const latency = Date.now() - start;
     balancer.decrementActive(backend.id);
     balancer.recordRequest(backend.id, { latency, error: true });
+
+    // Drop the session so the next request picks a healthy backend
+    if (sessionKey) deleteSessionById(sessionKey);
 
     logger.log({
       method: req.method, path: req.originalUrl,
@@ -474,7 +508,7 @@ async function handleResponsesAPI(req, res, balancer) {
     setSession(ip, model, backend);
   }
 
-  const chatBody = stripAnthropicOnly(responsesToChatBody(req.body));
+  const chatBody = normalizeForOllama(responsesToChatBody(req.body));
   const isStreaming = chatBody.stream === true;
   balancer.incrementActive(backend.id);
   const start = Date.now();
@@ -484,6 +518,7 @@ async function handleResponsesAPI(req, res, balancer) {
       method: "POST",
       headers: { ...filterHeaders(req.headers), host: new URL(backend.url).host, "content-type": "application/json" },
       body: JSON.stringify(chatBody),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
     const latency = Date.now() - start;
@@ -508,6 +543,7 @@ async function handleResponsesAPI(req, res, balancer) {
     const latency = Date.now() - start;
     balancer.decrementActive(backend.id);
     balancer.recordRequest(backend.id, { latency, error: true });
+    deleteSessionById(`${ip}::${model}`);
     logger.log({ method: "POST", path: "/v1/responses", status: 502, backend: backend.url, latency, error: err.message });
     if (!res.headersSent) res.status(502).json({ error: "Bad gateway", message: err.message });
   }
