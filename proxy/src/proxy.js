@@ -1,7 +1,9 @@
 import { randomUUID } from "crypto";
 import fetch from "node-fetch";
 import { logger } from "./logger.js";
-import { getSession, setSession, touchSession, deleteSessionById } from "./sessions.js";
+import { saveConfig } from "./config.js";
+import { parseMemoryError, registryWeightBytes, fmtBytes } from "./memory.js";
+import { getSession, setSession, touchSession, deleteSessionById, startSessionActivity, updateSessionActivity, finishSessionActivity } from "./sessions.js";
 
 // Per-request timeout; generous default for LLM inference but still catches dead backends
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "300000", 10);
@@ -136,10 +138,110 @@ function normalizeForOllama(body) {
   return rest;
 }
 
-// Single-backend proxy with session tracking
-async function proxyToOne(backend, req, res, balancer, sessionKey) {
+function extractPromptInfo(body) {
+  if (!body || typeof body !== "object") return { prompt: "", messages: [] };
+  if (typeof body.prompt === "string") {
+    return { prompt: body.prompt, messages: [{ role: "user", content: body.prompt }] };
+  }
+  if (Array.isArray(body.messages)) {
+    const msgs = body.messages.slice(-6).map((m) => ({
+      role: m.role || "user",
+      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+    }));
+    const lastUser = [...msgs].reverse().find((m) => m.role === "user") || msgs[msgs.length - 1];
+    return { prompt: lastUser?.content || "", messages: msgs };
+  }
+  if (typeof body.input === "string") {
+    return { prompt: body.input, messages: [{ role: "user", content: body.input }] };
+  }
+  if (Array.isArray(body.input)) {
+    const msgs = body.input.slice(-6).map((i) => ({
+      role: i.role || i.type || "user",
+      content: typeof i.content === "string" ? i.content : JSON.stringify(i.content || i),
+    }));
+    const lastUser = [...msgs].reverse().find((m) => m.role === "user") || msgs[msgs.length - 1];
+    return { prompt: lastUser?.content || "", messages: msgs };
+  }
+  return { prompt: "", messages: [] };
+}
+
+function parseStreamChunkForActivity(sessionKey, reqId, textChunk, state) {
+  if (!sessionKey) return;
+  state.buf = (state.buf || "") + textChunk;
+  const lines = state.buf.split("\n");
+  state.buf = lines.pop();
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const jsonStr = line.startsWith("data:") ? line.slice(5).trim() : line;
+    if (jsonStr === "[DONE]") continue;
+    let parsed;
+    try { parsed = JSON.parse(jsonStr); } catch { continue; }
+
+    let thinkingDelta = "";
+    let responseDelta = "";
+
+    // Ollama /api/chat
+    if (parsed.message) {
+      if (parsed.message.thinking) thinkingDelta += parsed.message.thinking;
+      if (parsed.message.reasoning_content) thinkingDelta += parsed.message.reasoning_content;
+      if (parsed.message.content) responseDelta += parsed.message.content;
+    }
+    // Ollama /api/generate
+    if (typeof parsed.response === "string") responseDelta += parsed.response;
+    if (typeof parsed.thinking === "string") thinkingDelta += parsed.thinking;
+
+    // OpenAI /v1/chat/completions (streaming or non-streaming)
+    const choice = parsed.choices?.[0];
+    if (choice) {
+      const d = choice.delta || choice.message || {};
+      if (d.reasoning_content) thinkingDelta += d.reasoning_content;
+      if (d.thinking) thinkingDelta += d.thinking;
+      if (d.reasoning) thinkingDelta += d.reasoning;
+      if (typeof d.content === "string") responseDelta += d.content;
+    }
+
+    // Extract <think>...</think> inline tags if present in responseDelta
+    if (responseDelta) {
+      state.fullRaw = (state.fullRaw || "") + responseDelta;
+      const thinkMatch = state.fullRaw.match(/<think>([\s\S]*?)(?:<\/think>|$)/i);
+      if (thinkMatch) {
+        const extractedThink = thinkMatch[1];
+        const cleanResp = state.fullRaw.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "");
+        updateSessionActivity(sessionKey, reqId, {
+          thinking: extractedThink,
+          response: cleanResp,
+        });
+        continue;
+      }
+    }
+
+    if (thinkingDelta || responseDelta) {
+      updateSessionActivity(sessionKey, reqId, { thinkingDelta, responseDelta });
+    }
+  }
+}
+
+// Single-backend proxy with session tracking + automatic OOM learning & retry
+async function proxyToOne(backend, req, res, balancer, sessionKey, triedIds = []) {
   balancer.incrementActive(backend.id);
   const start = Date.now();
+  const reqId = randomUUID();
+  const model = req.body?.model || null;
+  let decremented = false;
+  const doneActive = (patch) => {
+    if (!decremented) {
+      decremented = true;
+      balancer.decrementActive(backend.id);
+      if (sessionKey) finishSessionActivity(sessionKey, reqId, patch);
+    }
+  };
+
+  if (sessionKey) {
+    const { prompt, messages } = extractPromptInfo(req.body);
+    startSessionActivity(sessionKey, { reqId, path: req.originalUrl, backendUrl: backend.url, prompt, messages });
+  }
 
   try {
     let body;
@@ -156,26 +258,103 @@ async function proxyToOne(backend, req, res, balancer, sessionKey) {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
-    const latency = Date.now() - start;
-    balancer.decrementActive(backend.id);
-    balancer.recordRequest(backend.id, { latency });
+    // If upstream returned an error status (e.g. 500 OOM), inspect body before piping
+    if (!upstreamRes.ok && model) {
+      const errText = await upstreamRes.text();
+      const memErr = parseMemoryError(errText);
+      const latency = Date.now() - start;
+      doneActive({ error: memErr ? memErr.message : `HTTP ${upstreamRes.status}` });
+      balancer.recordRequest(backend.id, { latency, error: true });
+
+      if (memErr) {
+        balancer.recordMemoryError(backend.id, model, memErr);
+        saveConfig(balancer);
+        if (sessionKey) deleteSessionById(sessionKey);
+        logger.log({
+          method: req.method, path: req.originalUrl,
+          status: upstreamRes.status, backend: backend.url, latency,
+          error: memErr.message, note: `oom:${model}`,
+        });
+
+        // Automatically fail over to another capable node with sufficient memory
+        const nextTried = [...triedIds, backend.id];
+        if (nextTried.length < 4) {
+          const fallback = balancer.pickForModel(model, nextTried);
+          if (fallback && fallback.id !== backend.id) {
+            if (sessionKey) {
+              const ip = sessionKey.split("::")[0];
+              setSession(ip, model, fallback);
+            }
+            logger.log({
+              method: req.method, path: req.originalUrl,
+              status: 0, backend: fallback.url, latency: 0,
+              note: `oom-retry:${model}`,
+            });
+            return proxyToOne(fallback, req, res, balancer, sessionKey, nextTried);
+          }
+        }
+      } else {
+        logger.log({
+          method: req.method, path: req.originalUrl,
+          status: upstreamRes.status, backend: backend.url, latency,
+          sessionKey: sessionKey || null,
+        });
+      }
+
+      res.status(upstreamRes.status);
+      for (const [k, v] of upstreamRes.headers.entries()) {
+        if (!HOP_BY_HOP.has(k.toLowerCase())) try { res.setHeader(k, v); } catch {}
+      }
+      return res.send(errText);
+    }
 
     res.status(upstreamRes.status);
     for (const [k, v] of upstreamRes.headers.entries()) {
       if (!HOP_BY_HOP.has(k.toLowerCase())) try { res.setHeader(k, v); } catch {}
     }
 
-    logger.log({
-      method: req.method, path: req.originalUrl,
-      status: upstreamRes.status, backend: backend.url, latency,
-      sessionKey: sessionKey || null,
+    const streamState = { buf: "", fullRaw: "" };
+    upstreamRes.body.on("data", (chunk) => {
+      try {
+        const text = chunk.toString("utf8");
+        parseStreamChunkForActivity(sessionKey, reqId, text, streamState);
+        if (model && text.includes("memory")) {
+          const memErr = parseMemoryError(text);
+          if (memErr) {
+            balancer.recordMemoryError(backend.id, model, memErr);
+            saveConfig(balancer);
+          }
+        }
+      } catch {}
+    });
+
+    upstreamRes.body.on("end", () => {
+      if (streamState.buf) {
+        try { parseStreamChunkForActivity(sessionKey, reqId, "\n", streamState); } catch {}
+      }
+      const latency = Date.now() - start;
+      balancer.recordRequest(backend.id, { latency });
+      doneActive();
+      logger.log({
+        method: req.method, path: req.originalUrl,
+        status: upstreamRes.status, backend: backend.url, latency,
+        sessionKey: sessionKey || null,
+      });
+    });
+
+    upstreamRes.body.on("error", (err) => {
+      doneActive({ error: err.message });
+    });
+
+    res.on("close", () => {
+      doneActive();
     });
 
     upstreamRes.body.pipe(res);
 
   } catch (err) {
     const latency = Date.now() - start;
-    balancer.decrementActive(backend.id);
+    doneActive({ error: err.message });
     balancer.recordRequest(backend.id, { latency, error: true });
 
     // Drop the session so the next request picks a healthy backend
@@ -192,7 +371,7 @@ async function proxyToOne(backend, req, res, balancer, sessionKey) {
   }
 }
 
-// Broadcast to all enabled backends
+// Broadcast to all enabled backends (with memory fit protection on /api/pull)
 async function broadcastToAll(backends, req, res, balancer) {
   if (backends.length === 0) return res.status(503).json({ error: "No enabled backends" });
 
@@ -200,12 +379,40 @@ async function broadcastToAll(backends, req, res, balancer) {
   res.setHeader("Transfer-Encoding", "chunked");
   res.status(200);
 
-  const body = JSON.stringify(req.body);
+  const isPull = req.path === "/api/pull";
+  const modelName = req.body?.name || req.body?.model || null;
+  const force = Boolean(req.body?.force || req.query?.force === "true" || req.headers["x-ollama-lb-force"] === "true");
+
+  let weightBytesHint = null;
+  if (isPull && modelName && !force) {
+    weightBytesHint = balancer.modelWeightBytes(modelName) ?? await registryWeightBytes(modelName);
+  }
+
+  const bodyObj = req.body && typeof req.body === "object" ? { ...req.body } : {};
+  delete bodyObj.force;
+  const body = JSON.stringify(bodyObj);
   const emit = (obj) => { try { res.write(JSON.stringify(obj) + "\n"); } catch {} };
 
   emit({ status: `Broadcasting to ${backends.length} backend(s)…` });
 
   await Promise.all(backends.map(async (backend) => {
+    if (isPull && modelName && !force) {
+      const fit = balancer.fitForId(backend.id, modelName, weightBytesHint);
+      if (fit && fit.fits === false) {
+        logger.log({
+          method: req.method, path: req.originalUrl, status: 409,
+          backend: backend.url, latency: 0,
+          note: `blocked-oom:${modelName}`, error: fit.reason,
+        });
+        emit({
+          backend: backend.url,
+          status: "skipped_insufficient_memory",
+          error: `Blocked pull of ${modelName}: ${fit.reason}. Pass "force": true to override.`,
+        });
+        return;
+      }
+    }
+
     const start = Date.now();
     balancer.incrementActive(backend.id);
     try {
@@ -354,7 +561,7 @@ function chatToResponsesBody(chatResp, model, respId) {
   };
 }
 
-function translateResponsesStream(upstream, res, model) {
+function translateResponsesStream(upstream, res, model, sessionKey, reqId, onDone) {
   const respId = `resp_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const msgId  = `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const baseResp = {
@@ -429,6 +636,7 @@ function translateResponsesStream(upstream, res, model) {
     }
 
     emit("response.completed", { response: { ...baseResp, status: "completed", output: finalOutput } });
+    if (onDone) onDone();
     res.end();
   }
 
@@ -448,9 +656,14 @@ function translateResponsesStream(upstream, res, model) {
       if (!choice) continue;
       const delta = choice.delta || {};
 
+      if (delta.reasoning_content || delta.thinking) {
+        if (sessionKey) updateSessionActivity(sessionKey, reqId, { thinkingDelta: delta.reasoning_content || delta.thinking });
+      }
+
       if (delta.content) {
         ensurePrologue();
         fullText += delta.content;
+        if (sessionKey) updateSessionActivity(sessionKey, reqId, { responseDelta: delta.content });
         emit("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: delta.content });
       }
 
@@ -485,7 +698,8 @@ function translateResponsesStream(upstream, res, model) {
   });
 
   upstream.body.on("end", () => { finish(); });
-  upstream.body.on("error", () => { if (!res.writableEnded) res.end(); });
+  upstream.body.on("error", (err) => { if (onDone) onDone({ error: err.message }); if (!res.writableEnded) res.end(); });
+  res.on("close", () => { if (onDone) onDone(); });
 }
 
 async function handleResponsesAPI(req, res, balancer) {
@@ -508,10 +722,23 @@ async function handleResponsesAPI(req, res, balancer) {
     setSession(ip, model, backend);
   }
 
+  const sessionKey = `${ip}::${model}`;
+  const reqId = randomUUID();
   const chatBody = normalizeForOllama(responsesToChatBody(req.body));
   const isStreaming = chatBody.stream === true;
+  const { prompt, messages } = extractPromptInfo(chatBody);
+  startSessionActivity(sessionKey, { reqId, path: "/v1/responses", backendUrl: backend.url, prompt, messages });
+
   balancer.incrementActive(backend.id);
   const start = Date.now();
+  let decremented = false;
+  const doneActive = (patch) => {
+    if (!decremented) {
+      decremented = true;
+      balancer.decrementActive(backend.id);
+      finishSessionActivity(sessionKey, reqId, patch);
+    }
+  };
 
   try {
     const upstream = await fetch(`${backend.url}/v1/chat/completions`, {
@@ -521,29 +748,47 @@ async function handleResponsesAPI(req, res, balancer) {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
-    const latency = Date.now() - start;
-    balancer.decrementActive(backend.id);
-    balancer.recordRequest(backend.id, { latency });
-    logger.log({ method: "POST", path: "/v1/responses", status: upstream.status, backend: backend.url, latency, sessionKey: `${ip}::${model}`, note: "responses→chat" });
-
     if (!upstream.ok) {
+      const latency = Date.now() - start;
       const errText = await upstream.text();
+      const memErr = parseMemoryError(errText);
+      doneActive({ error: memErr ? memErr.message : `HTTP ${upstream.status}` });
+      balancer.recordRequest(backend.id, { latency, error: true });
+      if (memErr) {
+        balancer.recordMemoryError(backend.id, model, memErr);
+        saveConfig(balancer);
+        deleteSessionById(sessionKey);
+      }
+      logger.log({ method: "POST", path: "/v1/responses", status: upstream.status, backend: backend.url, latency, sessionKey, note: memErr ? `oom:${model}` : "responses→chat", error: memErr?.message });
       if (!res.headersSent) res.status(upstream.status).send(errText);
       return;
     }
 
     if (isStreaming) {
-      translateResponsesStream(upstream, res, model);
+      translateResponsesStream(upstream, res, model, sessionKey, reqId, (patch) => {
+        const latency = Date.now() - start;
+        doneActive(patch);
+        balancer.recordRequest(backend.id, { latency });
+        logger.log({ method: "POST", path: "/v1/responses", status: upstream.status, backend: backend.url, latency, sessionKey, note: "responses→chat" });
+      });
     } else {
       const chatResp = await upstream.json();
+      const latency = Date.now() - start;
+      const msg = chatResp.choices?.[0]?.message || {};
+      doneActive({
+        thinking: msg.reasoning_content || msg.thinking || "",
+        response: msg.content || "",
+      });
+      balancer.recordRequest(backend.id, { latency });
+      logger.log({ method: "POST", path: "/v1/responses", status: upstream.status, backend: backend.url, latency, sessionKey, note: "responses→chat" });
       const respId = `resp_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
       res.json(chatToResponsesBody(chatResp, model, respId));
     }
   } catch (err) {
     const latency = Date.now() - start;
-    balancer.decrementActive(backend.id);
+    doneActive({ error: err.message });
     balancer.recordRequest(backend.id, { latency, error: true });
-    deleteSessionById(`${ip}::${model}`);
+    deleteSessionById(sessionKey);
     logger.log({ method: "POST", path: "/v1/responses", status: 502, backend: backend.url, latency, error: err.message });
     if (!res.headersSent) res.status(502).json({ error: "Bad gateway", message: err.message });
   }
@@ -588,16 +833,18 @@ export function createProxy(balancer) {
         // Check for an existing live session
         const existing = getSession(ip, model);
         if (existing) {
-          // Verify the pinned backend is still online
+          // Verify the pinned backend is still online and has enough memory for this model
+          const fit = balancer.fitForId(existing.backendId, model);
           const pinned = balancer.getBackends().find(
             (b) => b.id === existing.backendId && b.enabled && b.status === "online"
           );
-          if (pinned) {
+          if (pinned && fit?.fits !== false) {
             touchSession(ip, model);
             logger.log({ method: req.method, path: req.originalUrl, status: 0, backend: pinned.url, latency: 0, note: `session:${ip}` });
             return proxyToOne(pinned, req, res, balancer, `${ip}::${model}`);
           }
-          // Pinned backend went offline — fall through to pick a new one
+          // Pinned backend went offline or is now known OOM for this model — unpin and pick a new one
+          deleteSessionById(`${ip}::${model}`);
         }
 
         // No session or backend went offline — pick best backend for this model

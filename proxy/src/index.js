@@ -8,6 +8,8 @@ import { createProxy } from "./proxy.js";
 import { logger } from "./logger.js";
 import { listSessions, deleteSessionById, purgeBackendSessions, extendSession } from "./sessions.js";
 import { shodanSearch } from "./shodan.js";
+import { registryWeightBytes, estimateRequirement } from "./memory.js";
+import { verifyCanary } from "./canary.js";
 
 const app = express();
 app.use(cors());
@@ -66,6 +68,29 @@ app.post("/admin/ping-url", async (req, res) => {
       const latency = Date.now() - start;
       if (response.ok) {
         const data = await response.json().catch(() => ({}));
+
+        // Check if node is an Ollama honeypot with fake canned responses
+        let canaryHoneypot = false;
+        let honeypotReason = null;
+        try {
+          const tagsRes = await fetch(`${cleanUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
+          if (tagsRes.ok) {
+            const tagsData = await tagsRes.json();
+            const models = tagsData.models || [];
+            if (models.length > 0) {
+              const canary = await verifyCanary(cleanUrl, models, 8000);
+              if (canary.honeypot) {
+                canaryHoneypot = true;
+                honeypotReason = canary.reason;
+              }
+            }
+          }
+        } catch {}
+
+        if (canaryHoneypot) {
+          return res.json({ online: false, honeypot: true, reason: honeypotReason, version: data.version || null, latency, attempt });
+        }
+
         return res.json({ online: true, version: data.version || null, latency, attempt });
       }
     } catch (e) {
@@ -85,21 +110,67 @@ app.post("/admin/backends/:id/check", async (req, res) => {
 });
 
 app.post("/admin/backends/:id/pull", async (req, res) => {
-  const { model } = req.body;
+  const { model, force = false } = req.body;
   if (!model) return res.status(400).json({ error: "model required" });
   const backend = balancer.getBackends().find((b) => b.id === req.params.id);
   if (!backend) return res.status(404).json({ error: "not found" });
   if (!backend.enabled || backend.status !== "online") return res.status(400).json({ error: "backend is offline" });
 
-  res.json({ status: "pulling", model, backend: backend.url });
+  let weightBytes = balancer.modelWeightBytes(model);
+  if (!weightBytes) weightBytes = await registryWeightBytes(model);
+  const fit = balancer.fitForId(req.params.id, model, weightBytes);
+
+  if (fit && fit.fits === false && !force) {
+    logger.log({
+      method: "POST", path: "/api/pull", status: 409,
+      backend: backend.url, latency: 0,
+      note: `blocked-oom:${model}`, error: fit.reason,
+    });
+    return res.status(409).json({
+      error: `Insufficient memory on ${backend.url}: ${fit.reason}`,
+      code: "INSUFFICIENT_MEMORY",
+      canOverride: true,
+      fit,
+    });
+  }
+
+  res.json({ status: "pulling", model, backend: backend.url, forced: Boolean(force), fit });
 
   fetch(`${backend.url}/api/pull`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name: model, stream: false }),
   })
-    .then(() => logger.log({ method: "POST", path: "/api/pull", status: 200, backend: backend.url, latency: 0, note: `pull:${model}` }))
+    .then(() => logger.log({ method: "POST", path: "/api/pull", status: 200, backend: backend.url, latency: 0, note: `${force ? "force-" : ""}pull:${model}` }))
     .catch((e) => logger.log({ method: "POST", path: "/api/pull", status: 502, backend: backend.url, latency: 0, error: e.message, note: `pull:${model}` }));
+});
+
+app.put("/admin/backends/:id/memory", (req, res) => {
+  const { manualLimitGiB, clearBlocks } = req.body || {};
+  let mem = null;
+  if (manualLimitGiB !== undefined) {
+    const val = manualLimitGiB === null || manualLimitGiB === "" ? null : parseFloat(manualLimitGiB);
+    mem = balancer.setMemoryLimit(req.params.id, isNaN(val) ? null : val);
+  }
+  if (clearBlocks) {
+    mem = balancer.clearMemoryBlocks(req.params.id);
+  }
+  if (!mem) return res.status(404).json({ error: "not found" });
+  saveConfig(balancer);
+  res.json({ ok: true, memory: mem });
+});
+
+app.get("/admin/memory-check", async (req, res) => {
+  const model = (req.query.model || "").trim();
+  if (!model) return res.status(400).json({ error: "model query parameter required" });
+  let weightBytes = balancer.modelWeightBytes(model);
+  if (!weightBytes) weightBytes = await registryWeightBytes(model);
+  const requiredBytes = estimateRequirement(weightBytes);
+  const fits = {};
+  for (const b of balancer.getBackends()) {
+    fits[b.id] = balancer.fitForId(b.id, model, weightBytes);
+  }
+  res.json({ model, weightBytes, requiredBytes, fits });
 });
 
 app.post("/admin/backends/check-all", async (req, res) => {
@@ -194,15 +265,25 @@ app.get("/admin/models", async (req, res) => {
     const size = presentOn.reduce((max, b) => Math.max(max, b.model?.size || 0), 0);
     const bestLatency = presentOn.reduce((min, b) => b.latency != null ? Math.min(min, b.latency) : min, Infinity);
 
+    const presentWithFit = presentOn.map((p) => ({
+      ...p,
+      fit: balancer.fitForId(p.backendId, name, size),
+    }));
+    const missingWithFit = missingOn.map((m) => ({
+      ...m,
+      fit: balancer.fitForId(m.backendId, name, size),
+    }));
+
     return {
       name, size,
+      estimatedRamBytes: estimateRequirement(size),
       toolCompatible: toolCompatMap[name] ?? false,
       modifiedAt: presentOn[0]?.model?.modified_at || null,
       presentCount: presentOn.length,
       totalOnline: onlineCount,
       available: presentOn.length === onlineCount && onlineCount > 0,
-      presentOn,
-      missingOn,
+      presentOn: presentWithFit,
+      missingOn: missingWithFit,
       bestLatency: isFinite(bestLatency) ? bestLatency : null,
     };
   });
@@ -210,9 +291,9 @@ app.get("/admin/models", async (req, res) => {
   res.json({ backends: inventories, models, onlineBackendCount: onlineCount });
 });
 
-// Sync (pull to missing backends)
+// Sync (pull to missing backends, skipping nodes known to lack RAM unless force=true)
 app.post("/admin/sync", async (req, res) => {
-  const { model } = req.body;
+  const { model, force = false } = req.body;
   if (!model) return res.status(400).json({ error: "model required" });
 
   const backends = balancer.getBackends().filter((b) => b.enabled && b.status === "online");
@@ -229,15 +310,43 @@ app.post("/admin/sync", async (req, res) => {
   const missing = inventory.filter((b) => !b.hasModel);
   if (missing.length === 0) return res.json({ status: "already_synced", model });
 
-  res.json({ status: "pulling", model, targets: missing.map((b) => b.url) });
+  let weightBytes = balancer.modelWeightBytes(model);
+  if (!weightBytes) weightBytes = await registryWeightBytes(model);
 
+  const eligible = [];
+  const skipped = [];
   for (const b of missing) {
+    const fit = balancer.fitForId(b.id, model, weightBytes);
+    if (!force && fit && fit.fits === false) {
+      skipped.push({ url: b.url, id: b.id, reason: fit.reason });
+    } else {
+      eligible.push(b);
+    }
+  }
+
+  if (eligible.length === 0) {
+    return res.json({
+      status: "blocked_memory",
+      model,
+      targets: [],
+      skipped,
+    });
+  }
+
+  res.json({
+    status: "pulling",
+    model,
+    targets: eligible.map((b) => b.url),
+    skipped,
+  });
+
+  for (const b of eligible) {
     fetch(`${b.url}/api/pull`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: model, stream: false }),
     })
-      .then(() => logger.log({ method: "POST", path: "/api/pull", status: 200, backend: b.url, latency: 0, note: `sync:${model}` }))
+      .then(() => logger.log({ method: "POST", path: "/api/pull", status: 200, backend: b.url, latency: 0, note: `${force ? "force-" : ""}sync:${model}` }))
       .catch((e) => logger.log({ method: "POST", path: "/api/pull", status: 502, backend: b.url, latency: 0, error: e.message, note: `sync:${model}` }));
   }
 });

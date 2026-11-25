@@ -23,7 +23,7 @@ function Pulse({ color, size = 8 }) {
 }
 
 function statusColor(s) {
-  return s === "online" ? C.green : s === "offline" ? C.red : s === "checking" ? C.amber : C.muted;
+  return s === "online" ? C.green : s === "offline" ? C.red : s === "checking" ? C.amber : s === "honeypot" ? "#f43f5e" : C.muted;
 }
 
 function fmtSize(bytes) {
@@ -93,16 +93,34 @@ function StatCard({ label, value, sub, color }) {
 }
 
 // ── Backends tab ───────────────────────────────────────────────────────────
-function BackendRow({ backend, onRemove, onToggle, onCheck, checking, pullModel, onPull, pulling, pullResult }) {
+function fmtGiB(bytes) {
+  if (bytes == null) return null;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+
+function BackendRow({ backend, onRemove, onToggle, onCheck, checking, pullModel, pullFit, onPull, pulling, pullResult, onSetMemory }) {
+  const [editingMem, setEditingMem] = useState(false);
+  const [memInput, setMemInput] = useState("");
+  const mem = backend.memory || {};
+  const limitGiB = fmtGiB(mem.limitBytes);
+  const maxObsGiB = fmtGiB(mem.maxObservedBytes);
+  const blockedCount = mem.blockedList?.length || 0;
+  const pullBlocked = pullFit && pullFit.fits === false;
+
+  async function saveMem() {
+    await onSetMemory(backend.id, { manualLimitGiB: memInput.trim() === "" ? null : parseFloat(memInput) });
+    setEditingMem(false);
+  }
+
   return (
     <div style={{
       background: backend.enabled ? C.panel : C.bg,
-      border: `1px solid ${backend.enabled ? C.border : "#111827"}`,
+      border: `1px solid ${pullBlocked ? "#5a1515" : backend.enabled ? C.border : "#111827"}`,
       borderRadius: 8, opacity: backend.enabled ? 1 : 0.55, transition: "all 0.15s",
     }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 14px", flexWrap: "wrap" }}>
         <Pulse color={statusColor(backend.status)} />
-        <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ flex: 1, minWidth: 180 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             {backend.geo?.flag && (
               <span title={backend.geo.country} style={{ fontSize: 16, lineHeight: 1 }}>{backend.geo.flag}</span>
@@ -117,13 +135,86 @@ function BackendRow({ backend, onRemove, onToggle, onCheck, checking, pullModel,
         </div>
         {backend.ollamaVersion && <Chip>{`v${backend.ollamaVersion}`}</Chip>}
         {backend.modelCount != null && <Chip>{backend.modelCount} models</Chip>}
+        {backend.status === "honeypot" && (
+          <Chip style={{ borderColor: "#f43f5e", color: "#f43f5e", fontWeight: "bold" }} title={backend.checkNote || "Failed canary check: fake/canned responses"}>
+            ⚠ honeypot
+          </Chip>
+        )}
+        {backend.checkNote && backend.status !== "online" && (
+          <span style={{ fontFamily: mono, fontSize: 10, color: backend.status === "honeypot" ? "#f43f5e" : C.muted }} title={backend.checkNote}>
+            {backend.checkNote.length > 45 ? backend.checkNote.slice(0, 45) + "…" : backend.checkNote}
+          </span>
+        )}
+
+        {/* Memory capacity badge / editor */}
+        {!editingMem ? (
+          <Chip
+            onClick={() => {
+              setEditingMem(true);
+              setMemInput(mem.manualLimitBytes ? (mem.manualLimitBytes / 1024 ** 3).toFixed(1) : "");
+            }}
+            style={{
+              cursor: "pointer",
+              borderColor: limitGiB ? (mem.limitSource === "learned" ? C.amber : C.teal) : C.border,
+              color: limitGiB ? (mem.limitSource === "learned" ? C.amber : C.teal) : C.dim,
+            }}
+            title={
+              limitGiB
+                ? `Memory ceiling: ~${limitGiB} (${mem.limitSource === "learned" ? "learned from OOM error" : "manual limit"})${blockedCount ? ` · ${blockedCount} model(s) OOM-blocked` : ""}. Click to edit.`
+                : maxObsGiB
+                ? `Verified loaded up to ${maxObsGiB} via /api/ps. Click to set a manual RAM/VRAM limit (GiB).`
+                : "Memory unknown — click to set a manual RAM/VRAM ceiling (GiB)"
+            }
+          >
+            {limitGiB
+              ? `🧠 ≤${limitGiB}${mem.limitSource === "learned" ? " (OOM)" : ""}`
+              : maxObsGiB
+              ? `🧠 ≥${maxObsGiB}`
+              : "🧠 RAM ?"}
+          </Chip>
+        ) : (
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <input
+              autoFocus
+              value={memInput}
+              onChange={(e) => setMemInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") saveMem(); if (e.key === "Escape") setEditingMem(false); }}
+              placeholder="GiB"
+              style={{ width: 58, background: C.bg, border: `1px solid ${C.blue}`, color: C.white, borderRadius: 4, padding: "2px 6px", fontFamily: mono, fontSize: 11, outline: "none" }}
+            />
+            <Btn small onClick={saveMem}>save</Btn>
+            {(mem.learnedAvailableBytes || blockedCount > 0 || mem.manualLimitBytes) && (
+              <Btn small variant="ghost" title="Clear manual limit & learned OOM blocks" onClick={async () => { await onSetMemory(backend.id, { manualLimitGiB: null, clearBlocks: true }); setEditingMem(false); }}>reset</Btn>
+            )}
+            <Btn small variant="danger" onClick={() => setEditingMem(false)}>✕</Btn>
+          </span>
+        )}
+
         {backend.activeRequests > 0 && <Chip accent>{backend.activeRequests} active</Chip>}
         {backend.totalRequests > 0 && <Chip>{backend.totalRequests} req</Chip>}
         {backend.lastLatency != null && <Chip>{backend.lastLatency}ms</Chip>}
         {pullModel && (
-          <Btn small variant="warn" onClick={() => onPull(backend.id)} disabled={pulling || !backend.enabled || backend.status !== "online"} title={backend.status !== "online" ? "Backend offline" : `Pull ${pullModel}`}>
-            {pulling ? "pulling…" : "↓ pull"}
-          </Btn>
+          pullBlocked ? (
+            <Btn
+              small
+              variant="danger"
+              onClick={() => onPull(backend.id, true)}
+              disabled={pulling || !backend.enabled || backend.status !== "online"}
+              title={`${pullFit.reason} — Click to override and force pull anyway`}
+            >
+              {pulling ? "pulling…" : "⚠ override pull"}
+            </Btn>
+          ) : (
+            <Btn
+              small
+              variant="warn"
+              onClick={() => onPull(backend.id, false)}
+              disabled={pulling || !backend.enabled || backend.status !== "online"}
+              title={backend.status !== "online" ? "Backend offline" : pullFit?.reason || `Pull ${pullModel}`}
+            >
+              {pulling ? "pulling…" : "↓ pull"}
+            </Btn>
+          )
         )}
         <Btn small onClick={() => onCheck(backend.id)} disabled={checking}>{checking ? "…" : "ping"}</Btn>
         <Btn small variant={backend.enabled ? "success" : "ghost"} onClick={() => onToggle(backend.id, !backend.enabled)}>
@@ -131,17 +222,27 @@ function BackendRow({ backend, onRemove, onToggle, onCheck, checking, pullModel,
         </Btn>
         <Btn small variant="danger" onClick={() => onRemove(backend.id)}>✕</Btn>
       </div>
+      {pullModel && pullBlocked && !pullResult && (
+        <div style={{ padding: "0 14px 7px", fontFamily: mono, fontSize: 10, color: C.amber }}>
+          ⚠ Blocked by memory guard: {pullFit.reason}
+        </div>
+      )}
       {pullResult && (
-        <div style={{ padding: "0 14px 7px", fontFamily: mono, fontSize: 10, color: pullResult.ok ? C.teal : C.red }}>
-          {pullResult.ok ? "↓ " : "✗ "}{pullResult.msg}
+        <div style={{ padding: "0 14px 7px", fontFamily: mono, fontSize: 10, color: pullResult.ok ? C.teal : C.red, display: "flex", alignItems: "center", gap: 8 }}>
+          <span>{pullResult.ok ? "↓ " : "✗ "}{pullResult.msg}</span>
+          {pullResult.canOverride && (
+            <Btn small variant="danger" onClick={() => onPull(backend.id, true)} disabled={pulling}>
+              ⚠ Force pull anyway
+            </Btn>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function Chip({ children, accent, style: sx }) {
-  return <span style={{
+function Chip({ children, accent, style: sx, onClick, title }) {
+  return <span onClick={onClick} title={title} style={{
     display: "inline-block", background: accent ? "#0c3a5f" : C.panel,
     border: `1px solid ${accent ? C.blue : C.border}`,
     color: accent ? C.blue : C.text,
@@ -289,23 +390,25 @@ function SessionsTab() {
 }
 
 // ── Models tab ─────────────────────────────────────────────────────────────
-function NodePip({ url, latency, geo, has }) {
+function NodePip({ url, latency, geo, has, fit }) {
   const label = url.replace(/^https?:\/\//, "");
-  const tip = `${label}${latency != null ? ` · ${latency}ms` : ""}${geo?.country ? ` · ${geo.country}` : ""}`;
+  const oom = fit && fit.fits === false;
+  const tip = `${label}${latency != null ? ` · ${latency}ms` : ""}${geo?.country ? ` · ${geo.country}` : ""}${fit?.reason ? ` · ${fit.reason}` : ""}`;
   return (
     <span title={tip} style={{
       display: "inline-flex", alignItems: "center", gap: 4,
-      background: has ? "#0d2a0d" : C.surface,
-      border: `1px solid ${has ? "#166534" : C.muted}`,
+      background: oom ? "#2a0d0d" : has ? "#0d2a0d" : C.surface,
+      border: `1px solid ${oom ? "#7f1d1d" : has ? "#166534" : C.muted}`,
       borderRadius: 5, padding: "2px 7px",
       fontFamily: mono, fontSize: 10,
-      color: has ? C.green : C.muted,
+      color: oom ? C.red : has ? C.green : C.muted,
       whiteSpace: "nowrap",
     }}>
       {geo?.flag ? <span style={{ fontSize: 12 }}>{geo.flag}</span> : null}
       <span>{label}</span>
-      {has && latency != null && <span style={{ color: C.dim, marginLeft: 2 }}>{latency}ms</span>}
-      {!has && <span style={{ color: C.red, marginLeft: 2 }}>missing</span>}
+      {has && !oom && latency != null && <span style={{ color: C.dim, marginLeft: 2 }}>{latency}ms</span>}
+      {oom && <span style={{ color: C.amber, marginLeft: 2 }}>⚠ low RAM</span>}
+      {!has && !oom && <span style={{ color: C.red, marginLeft: 2 }}>missing</span>}
     </span>
   );
 }
@@ -325,16 +428,33 @@ function ModelsTab() {
 
   useEffect(() => { load(); }, [load]);
 
-  async function doSync(model) {
+  async function doSync(model, force = false) {
     setSyncing((s) => ({ ...s, [model]: true }));
     try {
-      const r = await api.sync(model);
-      setSyncResult((x) => ({
-        ...x, [model]: r.status === "already_synced"
-          ? { ok: true, msg: "Already on all nodes." }
-          : { ok: true, msg: `Pulling to ${r.targets.length} node(s)…` },
-      }));
-      if (r.status !== "already_synced") setTimeout(load, 6000);
+      const r = await api.sync(model, force);
+      if (r.status === "already_synced") {
+        setSyncResult((x) => ({ ...x, [model]: { ok: true, msg: "Already on all nodes." } }));
+      } else if (r.status === "blocked_memory") {
+        setSyncResult((x) => ({
+          ...x,
+          [model]: {
+            ok: false,
+            canForce: true,
+            msg: `Blocked on all ${r.skipped.length} missing node(s) due to insufficient RAM (${r.skipped.map((s) => s.reason).join("; ")}).`,
+          },
+        }));
+      } else {
+        const skipNote = r.skipped?.length ? ` (skipped ${r.skipped.length} low-RAM node${r.skipped.length !== 1 ? "s" : ""})` : "";
+        setSyncResult((x) => ({
+          ...x,
+          [model]: {
+            ok: true,
+            canForce: Boolean(r.skipped?.length),
+            msg: `Pulling to ${r.targets.length} node(s)…${skipNote}`,
+          },
+        }));
+        setTimeout(load, 6000);
+      }
     } catch (e) {
       setSyncResult((x) => ({ ...x, [model]: { ok: false, msg: e.message } }));
     }
@@ -452,13 +572,18 @@ function ModelsTab() {
                         {m.missingOn.map((b, i) => <NodePip key={i} {...b} has={false} />)}
                       </div>
                       {res && (
-                        <div style={{ marginTop: 8, fontFamily: mono, fontSize: 11, color: res.ok ? C.teal : C.red }}>
-                          {res.ok ? "↑ " : "✗ "}{res.msg}
+                        <div style={{ marginTop: 8, fontFamily: mono, fontSize: 11, color: res.ok ? C.teal : C.red, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          <span>{res.ok ? "↑ " : "✗ "}{res.msg}</span>
+                          {res.canForce && (
+                            <Btn small variant="danger" onClick={() => doSync(m.name, true)} disabled={syncing[m.name]}>
+                              ⚠ Override & pull to low-RAM nodes
+                            </Btn>
+                          )}
                         </div>
                       )}
                     </div>
                     <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
-                      <Btn variant="sync" onClick={() => doSync(m.name)} disabled={syncing[m.name]}>
+                      <Btn variant="sync" onClick={() => doSync(m.name, false)} disabled={syncing[m.name]}>
                         {syncing[m.name] ? "pulling…" : `↓ Pull to ${m.missingOn.length} missing node${m.missingOn.length !== 1 ? "s" : ""}`}
                       </Btn>
                       <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, textAlign: "right", maxWidth: 180, lineHeight: 1.5 }}>
@@ -763,13 +888,16 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
               {displayResults.map((r) => {
                 const ping = pingStatus[r.ip];
                 const isOnline  = ping?.online === true;
-                const isOffline = ping?.online === false;
+                const isHoneypot = ping?.honeypot === true;
+                const isOffline = ping?.online === false && !isHoneypot;
                 const isChecking = ping === "checking";
                 const already = alreadyAdded(r.url) || added[r.ip];
 
-                const pingColor  = isOnline ? C.green : isOffline ? C.red : isChecking ? C.amber : C.muted;
+                const pingColor  = isOnline ? C.green : isHoneypot ? "#f43f5e" : isOffline ? C.red : isChecking ? C.amber : C.muted;
                 const pingLabel  = isOnline
                   ? `online (${ping.latency ? `${ping.latency}ms` : "ok"})`
+                  : isHoneypot
+                  ? `honeypot (${ping.reason || "fake response"})`
                   : isOffline
                   ? "unreachable"
                   : isChecking
@@ -779,7 +907,7 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
                 return (
                   <div key={r.ip} style={{
                     background: C.panel,
-                    border: `1px solid ${isOnline ? "#166534" : isOffline ? "#3f1515" : C.border}`,
+                    border: `1px solid ${isOnline ? "#166534" : isHoneypot ? "#5a1525" : isOffline ? "#3f1515" : C.border}`,
                     borderRadius: 10, overflow: "hidden",
                     opacity: isOffline ? 0.65 : 1,
                     transition: "border-color 0.3s",
@@ -844,13 +972,13 @@ function DiscoverTab({ onAddBackend, existingUrls }) {
                           {isChecking ? "…" : "ping"}
                         </button>
                         <Btn
-                          variant={already ? "success" : isOffline ? "ghost" : "primary"}
+                          variant={already ? "success" : isHoneypot ? "danger" : isOffline ? "ghost" : "primary"}
                           small
                           disabled={already || adding[r.ip]}
                           onClick={() => addNode(r)}
-                          title={already ? "Already added" : isOffline ? "Node appears unreachable — add anyway?" : "Add to load balancer"}
+                          title={already ? "Already added" : isHoneypot ? `Warning: ${ping.reason || "Honeypot detected"} — add anyway?` : isOffline ? "Node appears unreachable — add anyway?" : "Add to load balancer"}
                         >
-                          {already ? "✓ added" : adding[r.ip] ? "adding…" : "+ Add node"}
+                          {already ? "✓ added" : adding[r.ip] ? "adding…" : isHoneypot ? "⚠ add honeypot" : "+ Add node"}
                         </Btn>
                       </div>
                     </div>
@@ -896,11 +1024,22 @@ export default function App() {
   const [adding, setAdding] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
   const [pullModel, setPullModel] = useState("");
+  const [pullCheck, setPullCheck] = useState(null);
   const [pulling, setPulling] = useState({});
   const [pullResult, setPullResult] = useState({});
   const [editingVersion, setEditingVersion] = useState(false);
   const [versionInput, setVersionInput] = useState("");
   const logRef = useRef(null);
+
+  // Debounced memory-check whenever pullModel changes
+  useEffect(() => {
+    const m = pullModel.trim();
+    if (!m) { setPullCheck(null); return; }
+    const t = setTimeout(async () => {
+      try { setPullCheck(await api.memoryCheck(m)); } catch { setPullCheck(null); }
+    }, 350);
+    return () => clearTimeout(t);
+  }, [pullModel]);
 
   const fetchStatus = useCallback(async () => {
     try { setStatus(await api.status()); setError(null); }
@@ -943,17 +1082,32 @@ export default function App() {
     setChecking((c) => ({ ...c, [id]: false }));
   }
 
-  async function pullToBackend(id) {
+  async function pullToBackend(id, force = false) {
     if (!pullModel.trim()) return;
     setPulling((p) => ({ ...p, [id]: true }));
     setPullResult((r) => ({ ...r, [id]: null }));
     try {
-      await api.pullToBackend(id, pullModel.trim());
-      setPullResult((r) => ({ ...r, [id]: { ok: true, msg: `Pulling ${pullModel.trim()} in background…` } }));
+      await api.pullToBackend(id, pullModel.trim(), force);
+      setPullResult((r) => ({ ...r, [id]: { ok: true, msg: `${force ? "Force-pulling" : "Pulling"} ${pullModel.trim()} in background…` } }));
     } catch (e) {
-      setPullResult((r) => ({ ...r, [id]: { ok: false, msg: e.message } }));
+      setPullResult((r) => ({
+        ...r,
+        [id]: { ok: false, msg: e.message, canOverride: Boolean(e.data?.canOverride) },
+      }));
     }
     setPulling((p) => ({ ...p, [id]: false }));
+  }
+
+  async function setBackendMemory(id, payload) {
+    try {
+      await api.setMemory(id, payload);
+      await fetchStatus();
+      if (pullModel.trim()) {
+        try { setPullCheck(await api.memoryCheck(pullModel.trim())); } catch {}
+      }
+    } catch (e) {
+      setError(e.message);
+    }
   }
 
   async function checkAll() {
@@ -1110,8 +1264,15 @@ export default function App() {
                 {pullModel && <Btn small variant="ghost" onClick={() => { setPullModel(""); setPullResult({}); }}>clear</Btn>}
               </div>
               {pullModel && (
-                <div style={{ marginTop: 8, fontFamily: mono, fontSize: 11, color: C.dim }}>
-                  Click <span style={{ color: C.amber }}>↓ pull</span> on the backends you want to pull to.
+                <div style={{ marginTop: 8, fontFamily: mono, fontSize: 11, color: C.dim, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                  <span>
+                    Click <span style={{ color: C.amber }}>↓ pull</span> on the backends you want to pull to. Nodes with insufficient RAM are blocked automatically (click <span style={{ color: C.red }}>⚠ override pull</span> to force).
+                  </span>
+                  {pullCheck?.requiredBytes && (
+                    <span style={{ color: C.teal }}>
+                      Est. RAM required: ~{fmtGiB(pullCheck.requiredBytes)} (weights: {fmtGiB(pullCheck.weightBytes)})
+                    </span>
+                  )}
                 </div>
               )}
             </Card>
@@ -1127,8 +1288,10 @@ export default function App() {
                       <BackendRow key={b.id} backend={b}
                         onRemove={removeBackend} onToggle={toggleBackend}
                         onCheck={checkBackend} checking={checking[b.id]}
-                        pullModel={pullModel} onPull={pullToBackend}
-                        pulling={pulling[b.id]} pullResult={pullResult[b.id]} />
+                        pullModel={pullModel} pullFit={pullCheck?.fits?.[b.id]}
+                        onPull={pullToBackend}
+                        pulling={pulling[b.id]} pullResult={pullResult[b.id]}
+                        onSetMemory={setBackendMemory} />
                     ))}
                   </div>
               }
